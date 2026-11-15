@@ -241,8 +241,6 @@ class PaliGemmaWithExpertModel(nn.Module):
             # Process all layers with gradient checkpointing if enabled
             all_hidden_states = () if output_hidden_states else None
             for layer_idx in range(num_layers):
-                if output_hidden_states:
-                    all_hidden_states += (inputs_embeds,)
                 if use_gradient_checkpointing:
                     inputs_embeds = torch.utils.checkpoint.checkpoint(
                         compute_layer_complete,
@@ -259,7 +257,9 @@ class PaliGemmaWithExpertModel(nn.Module):
                         layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond
                     )
 
-                # Old code removed - now using compute_layer_complete function above
+                # [Spatial-DsRA v3]: Exactly L block outputs, excluding input embeddings/final norm.
+                if output_hidden_states:
+                    all_hidden_states += (inputs_embeds,)
 
             # final norm
             # Define final norm computation function for gradient checkpointing
@@ -278,8 +278,6 @@ class PaliGemmaWithExpertModel(nn.Module):
             else:
                 outputs_embeds = compute_final_norms(inputs_embeds, adarms_cond)
 
-            if output_hidden_states:
-                all_hidden_states += (outputs_embeds,)
 
             prefix_output = outputs_embeds[0]
             suffix_output = outputs_embeds[1]

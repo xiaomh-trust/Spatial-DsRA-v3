@@ -11,7 +11,7 @@ from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
 from vggt.utils.load_fn import preprocess_images_from_openpi
-from vggt.heads.utils import custom_pooling
+from openpi.models_pytorch.spatial_dsra import teacher_target, extract_teacher
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -333,7 +333,8 @@ class PI0Pytorch(nn.Module):
         images, img_wo_aug, img_padding_mask, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
             observation, train=True, get_wo_aug=True
         )
-        img_resize_wo_aug = preprocess_images_from_openpi(img_wo_aug)  # specific for VGGT with 518px input
+        # [Spatial-DsRA v3]: Reuse actual VLA pixels after augmentation, inverted from [-1,1] to [0,1].
+        img_resize_wo_aug = preprocess_images_from_openpi([(img + 1) / 2 for img in images])  # specific for VGGT with 518px input
 
         # =================================== VLA action loss ===================================
 
@@ -398,23 +399,18 @@ class PI0Pytorch(nn.Module):
         # =================================== Alignment loss ===================================
 
         # VLA hidden states
-        (prefix_hidden, _) = all_hidden_states[self.vla_layers_align]  # 18 total layers of paligemma
-        vision_hidden = prefix_hidden[:, :img_len, :]
+        # [Spatial-DsRA v3]: Supervise only prefix visual patches from all multimodal blocks.
+        vision_hidden = tuple(prefix[:, :img_len, :] for prefix, _ in all_hidden_states)
 
-        # VGGT hidden states
-        with torch.autocast("cuda", dtype=torch.bfloat16), torch.no_grad():
-            vggt_output = vggt(img_resize_wo_aug)
-        agg_vggt_hidden = vggt_output["features"][self.vggt_layers_align]  # 24 for total layers of VGGT
-        patch_start_idx = vggt_output["patch_start_idx"]
-        original_img = vggt_output["images"]
-        vggt_hidden = agg_vggt_hidden[:, :, patch_start_idx:, :]
+        # [Spatial-DsRA v3]: Teacher receives the same augmented image coordinates as the VLA.
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            vggt_hidden, (patch_h, patch_w) = extract_teacher(vggt, img_resize_wo_aug, self.vggt_layers_align)
 
-        # Resample VGGT hidden states to match the resolution of VLA hidden states
-        H, W = original_img.shape[-2:]
-        patch_h, patch_w = H // vggt.patch_size, W // vggt.patch_size
-        vggt_hidden = custom_pooling(
-            vggt_hidden, (patch_h, patch_w), (H, W), vision_hidden, self.pooling_func, self.use_vggt_pe
-        )
+        # [Spatial-DsRA v3]: Explicit per-camera target resolution and post-resize PE.
+        side = math.isqrt(img_len // len(images))
+        if side * side * len(images) != img_len:
+            raise ValueError("Expected square patch grid per camera")
+        vggt_hidden = teacher_target(vggt_hidden, (patch_h, patch_w), (side, side))
 
         # empty image feature masks for alignment loss
         tokens_per_img = img_len // len(images)
@@ -423,7 +419,7 @@ class PI0Pytorch(nn.Module):
 
         # useless non-rectangular image padding feature masks for alignment loss
         img_padding_mask = torch.stack(img_padding_mask, dim=1)
-        target_size = img_padding_mask.shape[-1] // 14  # 224/14, where 14 is the patch size of Gemma encoder
+        target_size = side  # [Spatial-DsRA v3]: Match actual visual token grid, not a hard-coded patch size.
         mask_downsampled = F.interpolate(
             img_padding_mask.float(), 
             size=(target_size, target_size), 
@@ -435,9 +431,9 @@ class PI0Pytorch(nn.Module):
 
         # calculate align loss
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            align_loss = align_proj(vision_hidden, vggt_hidden, align_mask)
+            align_result = align_proj(vision_hidden, vggt_hidden, align_mask)
 
-        return action_loss, align_loss
+        return action_loss, align_result
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:

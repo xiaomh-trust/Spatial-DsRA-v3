@@ -473,6 +473,19 @@ class TrainConfig:
     # Optional path to a PyTorch checkpoint to load weights from.
     pytorch_weight_path: str | None = None
 
+    # [Spatial-DsRA v3]: Recommended defaults plus provisional regularization/Stage III settings.
+    dsra_teacher_cache: str | None = None
+    dsra_bottleneck: int = 256
+    dsra_rank: int = 32
+    dsra_a_max: float = 0.5
+    dsra_warmup_steps: int = 20_000
+    dsra_ramp_steps: int = 40_000
+    dsra_freeze_step: int = 100_000
+    dsra_beta_r: float = 1e-4
+    dsra_eta: float = 1e-4
+    dsra_basis_lr_scale: float = 0.1
+    dsra_lora_rank: int = 32
+
     # Spatial Forcing configs
     vggt_weight_path: str | None = None
     vggt_dim: int = 1024
@@ -795,14 +808,14 @@ _CONFIGS = [
         pytorch_weight_path='./checkpoints/pi0_base_full_torch',
         #
         vggt_weight_path='./checkpoints/vggt',
-        vla_layers_align=12,
+        vla_layers_align=None,  # [Spatial-DsRA v3]: All multimodal Transformer blocks.
         vggt_layers_align=-1,
         pooling_func='bilinear',
         use_vggt_pe=True,
         use_vlm_norm=True,
         align_loss_coeff=0.5,
         #
-        num_train_steps=20_000,
+        num_train_steps=150_000,  # [Spatial-DsRA v3]: Include all three stages.
         batch_size=16,
         ema_decay=None,
         wandb_enabled=False,

@@ -5,6 +5,7 @@ Fine-tunes OpenVLA via LoRA.
 """
 
 import os
+import math
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -22,7 +23,7 @@ from huggingface_hub import HfApi, snapshot_download
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import MultiStepLR, CosineAnnealingLR
+from torch.optim.lr_scheduler import MultiStepLR, LambdaLR
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -39,13 +40,13 @@ from experiments.robot.openvla_utils import (
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+from prismatic.models.spatial_dsra import SpatialDsRA, teacher_target, parameter_groups, FrozenTeacherCache, extract_teacher, spatial_diagnostics
 from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import (
     NoisyActionProjector,
     ProprioProjector,
-    AlignProjector,
 )
 from prismatic.training.train_utils import (
     compute_actions_l1_loss,
@@ -54,7 +55,6 @@ from prismatic.training.train_utils import (
     get_next_actions_mask,
 )
 from prismatic.util.data_utils import PaddedCollatorForActionPrediction
-from prismatic.util.pooling_utils import custom_pooling
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.constants import (
     ACTION_DIM,
@@ -84,6 +84,7 @@ class FinetuneConfig:
     run_root_dir: Path = Path("runs")                # Path to directory to store logs & checkpoints
     shuffle_buffer_size: int = 100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
 
+    # [Spatial-DsRA v3]: Full-layer cosine alignment with mandatory LN, PE and exact patch positions.
     # Algorithm and architecture
     align_loss_type: str = "cosine"                  # Loss function for alignment loss, "cosine"
     align_loss_coeff: float = 0.5                          # Coefficient for alignment loss (multiplied by align_loss)
@@ -94,11 +95,24 @@ class FinetuneConfig:
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
     pooling_func: str = "bilinear"                   # resize VGGT state pixels to vla pixels
-    vla_layers_align: int = -1                       # which layer of the VLA hidden state to align, 33 for total
+    vla_layers_align: int = -1                       # Legacy sentinel; v3 always selects all Transformer blocks.
     vggt_layers_align: int = -1                      # which layer of the VGGT hidden state to align, 24 for total
-    use_vlm_norm: bool = False                       # whether to use VLM normalization for the VLM output vision embeddings
-    use_vggt_pe: bool = False                        # position embedding for vggt state before pooling
-    gain_feat_1move: bool = True                     # whether to gain the VLA feature moved one position backward
+    use_vlm_norm: bool = True                       # whether to use VLM normalization for the VLM output vision embeddings
+    use_vggt_pe: bool = True                        # v3 adds position embedding after bilinear resampling.
+    gain_feat_1move: bool = False                     # whether to gain the VLA feature moved one position backward
+
+    # [Spatial-DsRA v3]: Proposal defaults; unspecified values are provisional experiment settings.
+    base_vla_path: Optional[str] = None  # [Spatial-DsRA v3]: Unmerged initialization path for exact resume.
+    dsra_teacher_cache: Optional[str] = None  # Exact-input cache; optional for online augmented training.
+    dsra_bottleneck: int = 256
+    dsra_rank: int = 32
+    dsra_a_max: float = 0.5
+    dsra_warmup_steps: int = 20_000
+    dsra_ramp_steps: int = 40_000
+    dsra_freeze_step: int = 100_000
+    dsra_beta_r: float = 1e-4
+    dsra_eta: float = 1e-4
+    dsra_basis_lr_scale: float = 0.1
 
     # Training configuration
     batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
@@ -106,7 +120,7 @@ class FinetuneConfig:
     lr_warmup_steps: int = 0                         # Number of steps to warm up learning rate (from 10% to 100%)
     num_steps_before_decay: int = 100_000            # Number of steps before LR decays by 10x
     grad_accumulation_steps: int = 1                 # Number of gradient accumulation steps
-    max_steps: int = 200_000                         # Max number of training steps
+    max_steps: int = 150_000                         # Max number of training steps
     use_val_set: bool = False                        # If True, uses validation set and log validation metrics
     val_freq: int = 10_000                           # (When `use_val_set==True`) Validation set logging frequency in steps
     val_time_limit: int = 180                        # (When `use_val_set==True`) Time limit for computing validation metrics
@@ -273,7 +287,10 @@ def init_module(
     count_parameters(module, module_name)
 
     if cfg.resume:
-        state_dict = load_checkpoint(module_name, cfg.vla_path, cfg.resume_step)
+        # [Spatial-DsRA v3]: Support both numbered and latest-only auxiliary checkpoints.
+        latest = Path(cfg.vla_path) / f"{module_name}--latest_checkpoint.pt"
+        state_dict = (remove_ddp_in_checkpoint(torch.load(latest, weights_only=True, map_location="cpu"))
+                      if latest.exists() else load_checkpoint(module_name, cfg.vla_path, cfg.resume_step))
         module.load_state_dict(state_dict)
 
     if to_bf16:
@@ -349,55 +366,59 @@ def run_forward_pass(
     else:
         noise, noisy_actions, diffusion_timestep_embeddings = None, None, None
 
+    # [Spatial-DsRA v3]: BOS precedes visual patches; exclude proprio and diffusion time tokens.
+    vision_length = num_patches - int(use_proprio) - int(use_diffusion)
+    vision_hidden = []
+    def capture_visual(module, args, result):
+        hidden = result[0] if isinstance(result, tuple) else result
+        vision_hidden.append(hidden[:, 1:1 + vision_length, :])
+    handles = [block.register_forward_hook(capture_visual)
+               for block in vla.module.language_model.model.layers]
     # VLA forward pass
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        output: CausalLMOutputWithPast = vla(
-            input_ids=batch["input_ids"].to(device_id),
-            attention_mask=batch["attention_mask"].to(device_id),
-            pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
-            labels=batch["labels"],
-            output_hidden_states=True,
-            proprio=batch["proprio"] if use_proprio else None,
-            proprio_projector=proprio_projector if use_proprio else None,
-            noisy_actions=noisy_actions if use_diffusion else None,
-            noisy_action_projector=noisy_action_projector if use_diffusion else None,
-            diffusion_timestep_embeddings=diffusion_timestep_embeddings if use_diffusion else None,
-            use_film=use_film,
-        )
+    try:
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            output: CausalLMOutputWithPast = vla(
+                input_ids=batch["input_ids"].to(device_id),
+                attention_mask=batch["attention_mask"].to(device_id),
+                pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
+                labels=batch["labels"],
+                output_hidden_states=True,
+                proprio=batch["proprio"] if use_proprio else None,
+                proprio_projector=proprio_projector if use_proprio else None,
+                noisy_actions=noisy_actions if use_diffusion else None,
+                noisy_action_projector=noisy_action_projector if use_diffusion else None,
+                diffusion_timestep_embeddings=diffusion_timestep_embeddings if use_diffusion else None,
+                use_film=use_film,
+            )
+
+    finally:
+        for handle in handles:
+            handle.remove()
 
     # Get action masks needed for logging
     ground_truth_token_ids = batch["labels"][:, 1:].to(device_id)
     current_action_mask = get_current_action_mask(ground_truth_token_ids)
     next_actions_mask = get_next_actions_mask(ground_truth_token_ids)
 
-    # vla hidden states
-    projected_embeddings = output.projector_features
-    vision_length = projected_embeddings.shape[-2] - 1 if use_proprio else projected_embeddings.shape[-2]
-    vla_hidden = output.hidden_states[layers_align[0]]  # 33 for total layers of VLA-7B
-    boi_ids = 2 if gain_feat_1move else 1
-    vision_hidden = vla_hidden[:, boi_ids: vision_length+boi_ids, :].clone()  # [bs, 512, 4096]
-
     # VGGT hidden states
     vggt.eval()
     unnorm_imgs = preprocess_normed_images(
         batch['pixel_values'], processor.image_processor, num_images_in_input
     ).to(device_id)
-    with torch.autocast("cuda", dtype=torch.bfloat16), torch.no_grad():
-        vggt_output = vggt(unnorm_imgs)
-    agg_vggt_hidden = vggt_output["features"][layers_align[1]]  # 24 for total layers of VGGT
-    patch_start_idx = vggt_output["patch_start_idx"]
-    original_img = vggt_output["images"]
-    vggt_hidden = agg_vggt_hidden[:, :, patch_start_idx:, :]
-
-    # Resample VGGT hidden states to match the resolution of VLA hidden states
-    H, W = original_img.shape[-2:]
-    patch_h, patch_w = H // vggt.patch_size, W // vggt.patch_size
-    vggt_hidden = custom_pooling(vggt_hidden, (patch_h, patch_w), (H, W), vision_hidden, pooling_func, use_vggt_pe)
-
-    # calculate align loss
+    # [Spatial-DsRA v3]: Frozen teacher supports optional exact-input feature caching.
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        align_loss = align_projector(vision_hidden, vggt_hidden)
-    
+        vggt_hidden, (patch_h, patch_w) = extract_teacher(vggt, unnorm_imgs, layers_align[1])
+
+    # [Spatial-DsRA v3]: Explicit per-view grid, actual VGGT channels, PE after resampling.
+    side = int((vision_length // num_images_in_input) ** 0.5)
+    if side * side * num_images_in_input != vision_length:
+        raise ValueError("Expected a square VLA patch grid per camera")
+    vggt_hidden = teacher_target(vggt_hidden, (patch_h, patch_w), (side, side))
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        align_loss, regularization, layer_losses, reg_r, orth = align_projector(vision_hidden, vggt_hidden)
+    metrics.update({f"align_layer_{i+1}": value.item() for i, value in enumerate(layer_losses)})
+    metrics.update(reg_r=reg_r.item(), orth=orth.item())
+
     # Compute metrics for discrete action representation (next-token prediction)
     if not (use_l1_regression or use_diffusion):
         loss = output.loss
@@ -494,7 +515,10 @@ def run_forward_pass(
             )
 
     # Return both the loss tensor (with gradients) and the metrics dictionary (with detached values)
-    return loss + align_loss * align_loss_coeff, metrics
+    # [Spatial-DsRA v3]: Regularizers are separate from alpha; omitted automatically in Stage III.
+    total = loss + align_loss * align_loss_coeff + regularization
+    metrics["loss_value"] = total.item()
+    return total, metrics
 
 
 def run_diffusion_sampling(
@@ -639,6 +663,7 @@ def save_training_checkpoint(
     action_head,
     train_dataset,
     distributed_state,
+    optimizer, scheduler,
 ) -> None:
     """
     Save all training checkpoints including model components, LoRA adapter, and dataset statistics.
@@ -681,6 +706,9 @@ def save_training_checkpoint(
 
     # Save model components (main process only)
     if distributed_state.is_main_process:
+        # [Spatial-DsRA v3]: Resume optimizer/schedule at the same progressive-training step.
+        torch.save({"optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+                    "step": log_step, "base_vla_path": cfg.base_vla_path}, checkpoint_dir / "spatial_training.pt")
         # Save processor and LoRA adapter
         processor.save_pretrained(checkpoint_dir)
         vla.module.save_pretrained(adapter_dir)
@@ -711,7 +739,7 @@ def save_training_checkpoint(
     # Note: Can be very slow on some devices; if so, we recommend merging offline
     if cfg.use_lora and cfg.merge_lora_during_training:
         base_vla = AutoModelForVision2Seq.from_pretrained(
-            cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
+            cfg.base_vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
         )
         merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
         merged_vla = merged_vla.merge_and_unload()
@@ -737,6 +765,7 @@ def run_validation(
     log_step,
     distributed_state,
     val_time_limit,
+    align_projector, vggt, processor,
 ) -> None:
     """
     Compute validation set metrics for logging.
@@ -770,9 +799,14 @@ def run_validation(
             # Always compute L1 loss for validation, even for diffusion
             _, metrics = run_forward_pass(
                 vla=vla,
-                action_head=action_head,
+                action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
                 noisy_action_projector=noisy_action_projector,
                 proprio_projector=proprio_projector,
+                # [Spatial-DsRA v3]: Validation uses the same teacher and full-layer objective.
+                align_projector=align_projector, vggt=vggt, processor=processor,
+                pooling_func=cfg.pooling_func, layers_align=(cfg.vla_layers_align, cfg.vggt_layers_align),
+                use_vggt_pe=cfg.use_vggt_pe, gain_feat_1move=cfg.gain_feat_1move,
+                align_loss_coeff=cfg.align_loss_coeff, num_images_in_input=cfg.num_images_in_input,
                 batch=batch,
                 action_tokenizer=action_tokenizer,
                 device_id=device_id,
@@ -829,6 +863,14 @@ def finetune(cfg: FinetuneConfig) -> None:
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
         "Cannot do both L1 regression and diffusion. Please pick one of them!"
     )
+
+    # [Spatial-DsRA v3]: Reject legacy switches that contradict the full-layer design.
+    if cfg.pooling_func != "bilinear" or not cfg.use_vggt_pe or not cfg.use_vlm_norm or cfg.gain_feat_1move:
+        raise ValueError("v3 requires bilinear, PE, LN and unshifted patch selection")
+    if cfg.vla_layers_align != -1 or cfg.align_loss_type != "cosine":
+        raise ValueError("v3 always supervises all layers with cosine loss")
+    if cfg.dsra_freeze_step >= cfg.max_steps:
+        raise ValueError("max_steps must include Stage III")
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
@@ -889,10 +931,17 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Wait for model files to be synced
     dist.barrier()
 
+    # [Spatial-DsRA v3]: Resume adapters on the unmerged base, avoiding double application of LoRA.
+    if cfg.resume:
+        saved_training = torch.load(Path(cfg.vla_path) / "spatial_training.pt", map_location="cpu", weights_only=True)
+        cfg.base_vla_path = saved_training["base_vla_path"]
+    else:
+        cfg.base_vla_path = cfg.vla_path
+
     # Load processor and VLA
     processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
     vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.vla_path,
+        cfg.base_vla_path,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
@@ -907,10 +956,15 @@ def finetune(cfg: FinetuneConfig) -> None:
             r=cfg.lora_rank,
             lora_alpha=min(cfg.lora_rank, 16),
             lora_dropout=cfg.lora_dropout,
-            target_modules="all-linear",
+            # [Spatial-DsRA v3]: Attention Q/V in every multimodal language block only.
+            target_modules=r"language_model\.model\.layers\.\d+\.self_attn\.(q_proj|v_proj)",
+            # [Spatial-DsRA v3]: Discrete action mode fully trains and saves the LM action output head.
+            modules_to_save=["language_model.lm_head"] if not (cfg.use_l1_regression or cfg.use_diffusion) else None,
             init_lora_weights="gaussian",
         )
-        vla = get_peft_model(vla, lora_config)
+        # [Spatial-DsRA v3]: Restore trained LoRA on resume instead of creating random adapters.
+        vla = (PeftModel.from_pretrained(vla, Path(cfg.vla_path) / "lora_adapter", is_trainable=True)
+               if cfg.resume else get_peft_model(vla, lora_config))
         vla.print_trainable_parameters()
 
     # FiLM setup
@@ -944,12 +998,18 @@ def finetune(cfg: FinetuneConfig) -> None:
     vggt_model.load_state_dict(torch.load(cfg.vggt_path), strict=False)
     vggt_model = vggt_model.to(device_id)
 
+    # [Spatial-DsRA v3]: VGGT aggregation concatenates local/global features: dg=2*embed_dim.
+    vggt_model.requires_grad_(False).eval()
+    if cfg.dsra_teacher_cache:
+        vggt_model.spatial_cache = FrozenTeacherCache(cfg.dsra_teacher_cache, cfg.vggt_path)
     align_projector = init_module(
-        AlignProjector, "align_projector", cfg, device_id,
-        {"llm_dim": vla.module.llm_dim,
-         "vggt_dim": vggt_model.embed_dim,
-         "align_loss_type": cfg.align_loss_type,
-         "use_vlm_norm": cfg.use_vlm_norm,}
+        SpatialDsRA, "align_projector", cfg, device_id,
+        dict(llm_dim=vla.module.llm_dim, teacher_dim=2 * vggt_model.embed_dim,
+             num_layers=len(vla.module.language_model.model.layers),
+             bottleneck_dim=cfg.dsra_bottleneck, rank=cfg.dsra_rank, a_max=cfg.dsra_a_max,
+             warmup_steps=cfg.dsra_warmup_steps, ramp_steps=cfg.dsra_ramp_steps,
+             freeze_step=cfg.dsra_freeze_step, beta_r=cfg.dsra_beta_r, eta=cfg.dsra_eta),
+        find_unused_params=True,
     )
 
     # If applicable, instantiate proprio projector
@@ -1005,14 +1065,14 @@ def finetune(cfg: FinetuneConfig) -> None:
     trainable_params = [param for param in vla.parameters() if param.requires_grad]
     if cfg.use_l1_regression or cfg.use_diffusion:
         trainable_params += [param for param in action_head.parameters() if param.requires_grad]
-    if cfg.align_loss_type in ["cosine"]:
-        trainable_params += [param for param in align_projector.parameters() if param.requires_grad]
     if cfg.use_diffusion:
         trainable_params += [param for param in noisy_action_projector.parameters() if param.requires_grad]
     if cfg.use_proprio:
         trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
     print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
-    optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
+    # [Spatial-DsRA v3]: Keep future unfrozen parameters registered in the optimizer.
+    optimizer = AdamW(parameter_groups(align_projector.module, trainable_params,
+                                      cfg.learning_rate, cfg.dsra_basis_lr_scale))
 
     # Record original learning rate
     original_lr = optimizer.param_groups[0]["lr"]
@@ -1025,13 +1085,19 @@ def finetune(cfg: FinetuneConfig) -> None:
             gamma=0.1,  # Multiplicative factor of learning rate decay
         )
     elif cfg.scheduler == 'CosineAnnealingLR':
-        scheduler = CosineAnnealingLR(
-            optimizer,
-            T_max=cfg.max_steps,  # Total number of steps for the cosine annealing
-            eta_min=cfg.learning_rate * 1e-3,
-        )
+        # [Spatial-DsRA v3]: Apply one decay factor so M/rho retain their lower LR throughout.
+        scheduler = LambdaLR(optimizer, lr_lambda=lambda step:
+                             1e-3 + (1 - 1e-3) * (1 + math.cos(math.pi * min(step, cfg.max_steps) / cfg.max_steps)) / 2)
     else:
         raise ValueError(f"Unsupported scheduler type: {cfg.scheduler}")
+
+    # [Spatial-DsRA v3]: Restore moment estimates for shared projections, M and rho.
+    if cfg.resume:
+        training_state = torch.load(Path(cfg.vla_path) / "spatial_training.pt", map_location="cpu", weights_only=True)
+        if training_state["step"] != cfg.resume_step:
+            raise ValueError("resume_step does not match saved optimizer step")
+        optimizer.load_state_dict(training_state["optimizer"])
+        scheduler.load_state_dict(training_state["scheduler"])
 
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
@@ -1121,13 +1187,16 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Start training
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
         vla.train()
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)  # [Spatial-DsRA v3]: Frozen parameters must have no optimizer gradient.
         for batch_idx, batch in enumerate(dataloader):
+            # [Spatial-DsRA v3]: Schedule uses optimizer updates, including resume offset.
+            dsra_step = (cfg.resume_step or 0) + batch_idx // cfg.grad_accumulation_steps
+            align_projector.module.set_step(dsra_step)
             # Compute training metrics and loss
             compute_diffusion_l1 = cfg.use_diffusion and batch_idx % cfg.diffusion_sample_freq == 0
             loss, metrics = run_forward_pass(
                 vla=vla,
-                action_head=action_head,
+                action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
                 noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
                 proprio_projector=proprio_projector if cfg.use_proprio else None,
                 align_projector=align_projector if cfg.align_loss_type in ["cosine"] else None,
@@ -1156,11 +1225,14 @@ def finetune(cfg: FinetuneConfig) -> None:
 
             # Backward pass
             normalized_loss.backward()
+            # [Spatial-DsRA v3]: Monitor shared basis, layer modulation and backbone LoRA gradients.
+            if dsra_step % cfg.wandb_log_freq == 0:
+                metrics.update(spatial_diagnostics(align_projector.module, vla))
 
             # Store recent train metrics
             for metric_name, value in metrics.items():
-                if metric_name in recent_metrics:
-                    recent_metrics[metric_name].append(value)
+                # [Spatial-DsRA v3]: Include per-layer loss and regularizer diagnostics.
+                recent_metrics.setdefault(metric_name, deque(maxlen=cfg.grad_accumulation_steps)).append(value)
 
             # Compute gradient step index
             gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
@@ -1169,16 +1241,16 @@ def finetune(cfg: FinetuneConfig) -> None:
             smoothened_metrics = compute_smoothened_metrics(recent_metrics)
 
             # Push Metrics to W&B (every wandb_log_freq gradient steps)
-            log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
+            log_step = dsra_step + 1  # [Spatial-DsRA v3]: Completed update count for checkpoints/resume.
             if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
                 log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
 
             # [If applicable] Linearly warm up learning rate from 10% to 100% of original
-            if cfg.lr_warmup_steps > 0:
-                lr_progress = min((gradient_step_idx + 1) / cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
+            if cfg.lr_warmup_steps > 0 and dsra_step < cfg.lr_warmup_steps:  # [Spatial-DsRA v3]: Resume uses absolute updates.
+                lr_progress = min((dsra_step + 1) / cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
                 current_lr = original_lr * (0.1 + 0.9 * lr_progress)
                 for param_group in optimizer.param_groups:
-                    param_group["lr"] = current_lr
+                    param_group["lr"] = current_lr * param_group["lr_scale"]
 
             if distributed_state.is_main_process and gradient_step_idx % cfg.wandb_log_freq == 0:
                 # Log the learning rate
@@ -1194,11 +1266,11 @@ def finetune(cfg: FinetuneConfig) -> None:
             if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
                 optimizer.step()
                 scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)  # [Spatial-DsRA v3]: Frozen parameters must have no optimizer gradient.
                 progress.update()
 
             # Save model checkpoint: either keep latest checkpoint only or all checkpoints
-            if gradient_step_idx > 0 and log_step % cfg.save_freq == 0:
+            if (batch_idx + 1) % cfg.grad_accumulation_steps == 0 and (log_step % cfg.save_freq == 0 or log_step == cfg.max_steps):
                 torch.cuda.empty_cache()
                 save_training_checkpoint(
                     cfg=cfg,
@@ -1212,13 +1284,14 @@ def finetune(cfg: FinetuneConfig) -> None:
                     action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
                     train_dataset=train_dataset,
                     distributed_state=distributed_state,
+                    optimizer=optimizer, scheduler=scheduler,
                 )
 
             # Test model on validation set
-            if cfg.use_val_set and log_step > 0 and log_step % cfg.val_freq == 0:
+            if cfg.use_val_set and (batch_idx + 1) % cfg.grad_accumulation_steps == 0 and log_step % cfg.val_freq == 0:
                 run_validation(
                     vla=vla,
-                    action_head=action_head,
+                    action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
                     noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
                     align_projector=align_projector if cfg.align_loss_type in ["cosine"] else None,
                     proprio_projector=proprio_projector if cfg.use_proprio else None,
@@ -1230,12 +1303,13 @@ def finetune(cfg: FinetuneConfig) -> None:
                     log_step=log_step,
                     distributed_state=distributed_state,
                     val_time_limit=cfg.val_time_limit,
+                    vggt=vggt_model, processor=processor,
                 )
                 # Set model back to training mode after validation
                 vla.train()
 
             # Stop training when max_steps is reached
-            if log_step == cfg.max_steps:
+            if log_step >= cfg.max_steps and (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
                 print(f"Max step {cfg.max_steps} reached! Stopping training...")
                 break
 
